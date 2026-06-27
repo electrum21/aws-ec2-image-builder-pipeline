@@ -1,0 +1,191 @@
+stages:
+  - Terraform-Init-Validate-Plan
+  - Terraform-Apply
+  - Upload-Installers
+  - Trigger-Image-Pipeline
+  - Launch-Instance
+  - Terraform-Destroy
+
+variables:
+  AWS_REGION: "us-east-1"
+  S3_BUCKET: "ec2-image-builder-software-bucket"
+  RECIPE_NAME: "tfpractice-windows-recipe"
+  SSM_PARAMETER_NAME: "/latest_ami_id"
+  POLL_INTERVAL_SECONDS: "60"
+  BUILD_TIMEOUT_SECONDS: "14400"
+  TF_ROOT: "${CI_PROJECT_DIR}/terraform"
+  TF_STATE_NAME: "auto-ec2-image-builder"
+
+# ────────────────────────────────────────────────────────────────────────
+# TERRAFORM STAGES — only run when terraform/ files change
+# ────────────────────────────────────────────────────────────────────────
+
+Terraform-Init-Validate-Plan:
+  stage: Terraform-Init-Validate-Plan
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  script:
+    - cd $TF_ROOT
+    - terraform init
+    - terraform validate
+    - terraform plan -out=tfplan
+  artifacts:
+    paths:
+      - terraform/tfplan
+    expire_in: 8 hour
+  rules:
+    - changes:
+        - terraform/**/*
+        - components/**/*
+
+Terraform-Apply:
+  stage: Terraform-Apply
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  script:
+    - cd $TF_ROOT
+    - terraform init
+    - terraform apply -auto-approve tfplan
+  rules:
+    - changes:
+        - terraform/**/*
+        - components/**/*
+  needs:
+    - Terraform-Init-Validate-Plan
+  # when: manual  # require deliberate approval before changing live infra
+  environment:
+    name: production
+
+# ────────────────────────────────────────────────────────────────────────
+# IMAGE BUILD STAGES — independent of terraform changes, run on demand
+# ────────────────────────────────────────────────────────────────────────
+
+Upload-Installers:
+  stage: Upload-Installers
+  image: 
+    name: python:3.11-slim
+    entrypoint: [""]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl unzip
+    - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
+    - unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install
+  script:
+    - |
+      set -e
+      mkdir -p /tmp/installers/windows
+      mkdir -p /tmp/installers/python-library
+
+      curl -L --fail -o /tmp/installers/windows/python-3.11.9-amd64.exe \
+        https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
+
+      curl -L --fail -o /tmp/installers/windows/amazon-cloudwatch-agent.msi \
+        https://s3.amazonaws.com/amazoncloudwatch-agent/windows/amd64/latest/amazon-cloudwatch-agent.msi
+
+      pip download boto3 botocore pyodbc psycopg2-binary pymysql requests urllib3 \
+        pandas openpyxl python-dotenv pyyaml loguru tqdm tabulate \
+        -d /tmp/installers/python-library \
+        --platform win_amd64 --python-version 3.11 --only-binary=:all:
+
+      aws s3 sync /tmp/installers/windows/ s3://${S3_BUCKET}/windows/ --region $AWS_REGION
+      aws s3 sync /tmp/installers/python-library/ s3://${S3_BUCKET}/python-library/ --region $AWS_REGION
+  # rules:
+  #   - when: manual
+  allow_failure: false
+
+Trigger-Image-Pipeline:
+  stage: Trigger-Image-Pipeline
+  image: python:3.12-slim
+  before_script:
+    - pip install --no-cache-dir -r requirements.txt
+  script:
+    - python image_pipeline_orchestrator.py
+  variables:
+    # Hardcoded resource names (from `terraform output`) instead of
+    # GitLab CI/CD variables — edit these directly if Terraform ever
+    # recreates these resources with different names.
+    # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY remain as GitLab CI/CD
+    # variables (Settings → CI/CD → Variables) — never hardcode those here.
+    IMAGE_PIPELINE_NAME: "tfpractice-windows-pipeline"
+    INFRA_CONFIG_NAME: "tfpractice-windows-infra-config"
+    DIST_CONFIG_NAME: "tfpractice-windows-dist-config"
+    CW_COMPONENT_NAME: "install-cw-config-window"
+    PKG_COMPONENT_NAME: "install-window-package"
+    WU_COMPONENT_NAME: "update-wins-os"
+  # rules:
+  #   - when: manual
+  needs:
+    - job: Upload-Installers
+      optional: true  # allow triggering image build even if installers weren't re-uploaded this run
+  timeout: 5h
+
+Launch-Instance:
+  stage: Launch-Instance
+  image: python:3.12-slim
+  before_script:
+    - pip install --no-cache-dir boto3
+  script:
+    - python launch_instance.py
+  variables:
+    INSTANCE_TYPE: "t3.micro"
+    INSTANCE_NAME: "tfpractice-opsvm"
+    KEY_PAIR_NAME: "tfpractice-opsvm-keypair"
+    IAM_INSTANCE_PROFILE: "tfpractice-opsvm-profile"
+    SUBNET_ID: "" # leave blank to use default VPC, or set to specific subnet
+    ALLOWED_RDP_CIDR: "0.0.0.0/0"  # restrict to your IP or VPN CIDR in production
+  needs:
+    - job: Trigger-Image-Pipeline
+      optional: true
+  when: manual
+  environment:
+    name: production
+
+Terraform-Destroy:
+  stage: Terraform-Destroy
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [""]
+  before_script:
+    - curl -sL https://releases.hashicorp.com/terraform/1.9.0/terraform_1.9.0_linux_amd64.zip -o /tmp/tf.zip
+    - unzip -q /tmp/tf.zip -d /usr/local/bin
+  script:
+    - |
+      set -e
+
+      echo "==> Deleting Image Builder pipelines..."
+      PIPELINE_ARNS=$(aws imagebuilder list-image-pipelines \
+        --query 'imagePipelineList[*].arn' --output text --region $AWS_REGION)
+      for arn in $PIPELINE_ARNS; do
+        echo "Deleting pipeline: $arn"
+        aws imagebuilder delete-image-pipeline --image-pipeline-arn "$arn" --region $AWS_REGION
+      done
+
+      echo "==> Deleting Image Builder recipes..."
+      RECIPE_ARNS=$(aws imagebuilder list-image-recipes --owner Self \
+        --query 'imageRecipeSummaryList[*].arn' --output text --region $AWS_REGION)
+      for arn in $RECIPE_ARNS; do
+        echo "Deleting recipe: $arn"
+        aws imagebuilder delete-image-recipe --image-recipe-arn "$arn" --region $AWS_REGION || true
+      done
+
+      echo "==> Deleting Image Builder components..."
+      COMPONENT_VERSION_ARNS=$(aws imagebuilder list-components --owner Self \
+        --query 'componentVersionList[*].arn' --output text --region $AWS_REGION)
+      for version_arn in $COMPONENT_VERSION_ARNS; do
+        BUILD_ARNS=$(aws imagebuilder list-component-build-versions \
+          --component-version-arn "$version_arn" \
+          --query 'componentSummaryList[*].arn' --output text --region $AWS_REGION)
+        for build_arn in $BUILD_ARNS; do
+          echo "Deleting component: $build_arn"
+          aws imagebuilder delete-component --component-build-version-arn "$build_arn" --region $AWS_REGION || true
+        done
+      done
+
+      echo "==> Running terraform destroy..."
+      cd $TF_ROOT
+      terraform init
+      terraform destroy -auto-approve
+  when: manual
+  environment:
+    name: production
