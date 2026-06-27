@@ -1,0 +1,1 @@
+initial_parent_image_ami = "ami-09639480113b0df96"  # a real Windows AMI to seed with
