@@ -1,0 +1,113 @@
+name: InstallSoftwarePackages
+description: Downloads and installs software packages for Tfpractice OpsVM from S3
+schemaVersion: 1.0
+
+# Templated values injected by Terraform templatefile():
+#   ${installer_bucket}  ->  S3 bucket name
+#   ${aws_region}        ->  AWS region
+
+phases:
+  - name: build
+    steps:
+      - name: CreateTempDir
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - New-Item -ItemType Directory -Force -Path C:\Temp\Tfpractice | Out-Null
+
+      # AWS CLI
+
+      - name: InstallAWSCLI
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              if (Test-Path "C:\Program Files\Amazon\AWSCLIV2\aws.exe") {
+                Write-Host "AWS CLI already installed, skipping."
+              } else {
+                Write-Host "Installing AWS CLI..."
+                Start-Service -Name msiserver -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 5
+                $proc = Start-Process msiexec.exe `
+                  -ArgumentList '/i https://awscli.amazonaws.com/AWSCLIV2.msi /quiet /norestart' `
+                  -Wait -NoNewWindow -PassThru
+                if ($proc.ExitCode -ne 0) { throw "AWS CLI install failed with exit code $($proc.ExitCode)" }
+                Write-Host "AWS CLI installed."
+              }
+
+      # Python
+
+      - name: DownloadPython
+        action: S3Download
+        inputs:
+          - source: s3://${installer_bucket}/windows/python-3.11.9-amd64.exe
+            destination: C:\Temp\Tfpractice\python-installer.exe
+
+      - name: InstallPython
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              if (Get-Command python -ErrorAction SilentlyContinue) {
+                Write-Host "Python already installed, skipping."
+              } else {
+                Write-Host "Installing Python..."
+                Start-Service -Name msiserver -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 5
+                $proc = Start-Process C:\Temp\Tfpractice\python-installer.exe `
+                  -ArgumentList '/quiet InstallAllUsers=1 PrependPath=1 Include_test=0' `
+                  -Wait -NoNewWindow -PassThru
+                if ($proc.ExitCode -ne 0) { throw "Python install failed with exit code $($proc.ExitCode)" }
+                Write-Host "Python installed."
+              }
+
+      # Python Libraries (offline wheels from S3)
+
+      - name: DownloadPythonLibraries
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              Write-Host "Downloading Python wheels from S3..."
+              New-Item -ItemType Directory -Force -Path C:\Temp\Tfpractice\python-libs | Out-Null
+              $awsCli = "C:\Program Files\Amazon\AWSCLIV2\aws.exe"
+              if (-not (Test-Path $awsCli)) {
+                throw "AWS CLI not found at $awsCli - cannot download wheels"
+              }
+              & $awsCli s3 sync s3://${installer_bucket}/python-library/ C:\Temp\Tfpractice\python-libs\ --region ${aws_region}
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "S3 sync returned $LASTEXITCODE - folder may be empty or missing, continuing."
+              }
+              Write-Host "Download step complete."
+
+      - name: InstallPythonLibraries
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              Write-Host "Installing Python libraries from wheels..."
+              $wheelDir = "C:\Temp\Tfpractice\python-libs"
+              if (Test-Path $wheelDir) {
+                $wheels = Get-ChildItem $wheelDir -Filter *.whl | Select-Object -ExpandProperty FullName
+                if ($wheels) {
+                  Write-Host "Found $($wheels.Count) wheel(s), installing..."
+                  $wheelArgs = $wheels -join " "
+                  $proc = Start-Process python -ArgumentList "-m pip install --no-index --find-links=`"$wheelDir`" $wheelArgs" -Wait -NoNewWindow -PassThru
+                  if ($proc.ExitCode -ne 0) { throw "pip install failed with exit code $($proc.ExitCode)" }
+                  Write-Host "Python libraries installed."
+                } else {
+                  Write-Host "No .whl files found, skipping."
+                }
+              } else {
+                Write-Host "Wheel directory not found, skipping."
+              }
+
+      # Cleanup
+
+      - name: Cleanup
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              Remove-Item C:\Temp\Tfpractice -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Temp files cleaned up."

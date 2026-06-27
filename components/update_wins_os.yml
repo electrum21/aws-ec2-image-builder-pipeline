@@ -1,0 +1,54 @@
+name: UpdateWindowsOS
+description: |
+  Installs all pending Windows updates via PSWindowsUpdate.
+  MUST BE THE LAST COMPONENT - this step triggers a reboot.
+  Image Builder handles the reboot and resumes automatically.
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: InstallPSWindowsUpdate
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              Write-Host "Installing PSWindowsUpdate module..."
+              Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
+              Install-Module -Name PSWindowsUpdate -Force -AllowClobber -Scope AllUsers
+              Write-Host "PSWindowsUpdate installed."
+
+      - name: ApplyWindowsUpdates
+        action: ExecutePowerShell
+        timeoutSeconds: 14400
+        inputs:
+          commands:
+            - |
+              Import-Module PSWindowsUpdate
+              Write-Host "Checking for Windows updates..."
+              $updates = Get-WindowsUpdate -MicrosoftUpdate -Verbose
+              if ($updates.Count -eq 0) {
+                Write-Host "No updates available."
+              } else {
+                Write-Host "Applying $($updates.Count) update(s)..."
+                Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose
+                Write-Host "Updates applied."
+              }
+
+      - name: RebootForUpdates
+        action: Reboot
+        inputs:
+          delaySeconds: 60
+
+      - name: VerifyUpdates
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              Import-Module PSWindowsUpdate
+              $pending = Get-WURebootStatus -Silent
+              if ($pending) {
+                Write-Warning "Additional reboot still pending - consider running updates again."
+              } else {
+                Write-Host "All updates applied and system is clean."
+              }
