@@ -1,0 +1,74 @@
+name: InstallCloudWatchAgent
+description: Downloads and installs the CloudWatch Agent on Windows from S3
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: DownloadCWAgent
+        action: S3Download
+        inputs:
+          - source: s3://${installerBucket}/windows/amazon-cloudwatch-agent.msi
+            destination: C:\Temp\amazon-cloudwatch-agent.msi
+
+      - name: InstallCWAgent
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              if (Test-Path "C:\Program Files\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent.exe") {
+                Write-Host "CloudWatch Agent already installed, skipping."
+              } else {
+                Write-Host "Installing CloudWatch Agent..."
+                if (-not (Test-Path C:\Temp\amazon-cloudwatch-agent.msi)) {
+                  throw "MSI not found at C:\Temp\amazon-cloudwatch-agent.msi - S3Download may have failed"
+                }
+                Start-Service -Name msiserver -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 5
+                $proc = Start-Process msiexec.exe -ArgumentList '/i C:\Temp\amazon-cloudwatch-agent.msi /quiet /norestart /l*v C:\Temp\cw-agent-install.log' -Wait -NoNewWindow -PassThru
+                if ($proc.ExitCode -ne 0) {
+                  Get-Content C:\Temp\cw-agent-install.log -ErrorAction SilentlyContinue | Select-Object -Last 30
+                  throw "CloudWatch Agent MSI install failed with exit code $($proc.ExitCode)"
+                }
+                Write-Host "CloudWatch Agent installed successfully."
+              }
+
+      - name: WriteCloudWatchConfig
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              Write-Host "Writing CloudWatch Agent config..."
+              $dir = "C:\ProgramData\Amazon\AmazonCloudWatchAgent"
+              [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+              if (-not (Test-Path $dir)) {
+                throw "Failed to create directory $dir"
+              }
+              $json = '{"logs":{"logs_collected":{"windows_events":{"collect_list":[{"event_name":"System","event_levels":["CRITICAL","ERROR","WARNING"],"log_group_name":"/tfpractice/opsvm/system","log_stream_name":"{instance_id}"},{"event_name":"Application","event_levels":["CRITICAL","ERROR"],"log_group_name":"/tfpractice/opsvm/application","log_stream_name":"{instance_id}"}]}}},"metrics":{"namespace":"TfpracticeOpsVM","metrics_collected":{"cpu":{"measurement":["cpu_usage_idle","cpu_usage_user"]},"disk":{"measurement":["disk_used_percent"]},"mem":{"measurement":["mem_used_percent"]}}}}'
+              [System.IO.File]::WriteAllText("$dir\amazon-cloudwatch-agent.json", $json)
+              if (-not (Test-Path "$dir\amazon-cloudwatch-agent.json")) {
+                throw "Failed to write config file"
+              }
+              Write-Host "Config written successfully."
+              Get-Content "$dir\amazon-cloudwatch-agent.json"
+
+      - name: SetAgentAutoStart
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              & "C:\Program Files\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent-ctl.ps1" `
+                -a fetch-config `
+                -m ec2 `
+                -c file:"C:\ProgramData\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent.json"
+              Set-Service -Name AmazonCloudWatchAgent -StartupType Automatic
+              Write-Host "CloudWatch Agent configured for auto-start on boot."
+
+      - name: Cleanup
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - |
+              Remove-Item C:\Temp\amazon-cloudwatch-agent.msi -Force -ErrorAction SilentlyContinue
+              Remove-Item C:\Temp\cw-agent-install.log -Force -ErrorAction SilentlyContinue
+              Write-Host "Temp files cleaned up."
