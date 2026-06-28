@@ -83,10 +83,15 @@ Upload-Installers:
       curl -L --fail -o /tmp/installers/windows/amazon-cloudwatch-agent.msi \
         https://s3.amazonaws.com/amazoncloudwatch-agent/windows/amd64/latest/amazon-cloudwatch-agent.msi
 
-      pip download boto3 botocore pyodbc psycopg2-binary pymysql requests urllib3 \
-        pandas openpyxl python-dotenv pyyaml loguru tqdm tabulate \
+      pip download \
+        boto3 botocore pyodbc psycopg2-binary pymysql requests urllib3 \
+        pandas openpyxl python-dotenv pyyaml tqdm tabulate colorama \
+        tzdata win32-setctime \
         -d /tmp/installers/python-library \
-        --platform win_amd64 --python-version 3.11 --only-binary=:all:
+        --platform win_amd64 \
+        --python-version 3.11 \
+        --only-binary=:all: \
+        --no-cache-dir
 
       aws s3 sync /tmp/installers/windows/ s3://${S3_BUCKET}/windows/ --region $AWS_REGION
       aws s3 sync /tmp/installers/python-library/ s3://${S3_BUCKET}/python-library/ --region $AWS_REGION
